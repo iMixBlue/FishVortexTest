@@ -1,0 +1,122 @@
+#pragma kernel MainCS
+
+RWStructuredBuffer<float3> _PositionBuffer;
+RWStructuredBuffer<float3> _VelocityBuffer;
+
+int _totalFishNum;
+float  _DeltaTime;
+float2 _SpeedRange; 
+float  _MaxSteerForce;
+
+//Flocking
+float _Alignment, _AlignmentRadius, _Cohesion, _CohesionRadius, _Separation, _SeparationRadius;
+//Vortex
+float3 _TopAnchor, _BottomAnchor;
+float _TopRadius, _BottomRadius, _Eye, _Stiffness, _SwirlStrength;
+
+float3 CalculateSteer(float3 forceSum, float3 velocity)
+{
+	float3 force = forceSum * _SpeedRange.y - velocity;
+	return normalize(force) * min(length(force), _MaxSteerForce);
+}
+
+//equals to normal remap function in hlsl
+float CustomRemap(float value, float fromMin, float fromMax, float toMin, float toMax)
+{
+	return toMin + (value - fromMin) * (toMax - toMin) / (fromMax - fromMin);
+}
+
+float3 Flock(in float3 positionA, in float3 velocityA)
+{
+	float3 alignmentSum  = (float3)0, cohesionSum   = (float3)0, separationSum = (float3)0;
+	for (int i = 0; i < _totalFishNum; i++)
+	{
+		float3 positionB = _PositionBuffer[i];
+		float3 velocityB = _VelocityBuffer[i];
+
+		float3 offset = positionB - positionA; //fish - self
+		float  distance = length(offset);
+
+		if (distance != 0 && distance < _AlignmentRadius) alignmentSum += velocityB;
+		if (distance != 0 && distance < _CohesionRadius) cohesionSum += offset;
+		if (distance != 0 && distance < _SeparationRadius) separationSum -= offset / distance;
+	}
+	
+	float3 alignmentWeight = length(alignmentSum) > 0.0f? CalculateSteer(normalize(alignmentSum), velocityA) : (float3)0;
+	float3 cohesionWeight = length(cohesionSum) > 0.0f? CalculateSteer(normalize(cohesionSum), velocityA) : (float3)0;
+	float3 separationWeight = length(separationSum) > 0.0f? CalculateSteer(normalize(separationSum), velocityA) : 0;
+
+	float3 acceleration = alignmentWeight  * _Alignment + cohesionWeight   * _Cohesion + separationWeight * _Separation;
+	return acceleration;
+}
+
+
+float3 Vortex(in float3 positionA, in float3 velocityA,in float P_ID)
+{
+	float3 vortexForce = float3(0, 0, 0);
+	// projectPoint
+	float3 bottomToPos = positionA - _BottomAnchor;
+	float3 vortexAxis = normalize(_TopAnchor - _BottomAnchor);
+	float3 projection = dot(bottomToPos, vortexAxis) * vortexAxis;
+	float3 projectPoint = projection + _BottomAnchor;
+
+	float distanceBottom = abs(projectPoint.y - _BottomAnchor.y);
+	float upRate = distanceBottom / (_TopAnchor.y - _BottomAnchor.y);
+	if (projectPoint.y < _BottomAnchor.y)
+		upRate = -upRate;
+
+	float distancePerpend = length(projectPoint - positionA);
+	float localRadius = lerp(_BottomRadius, _TopRadius, saturate(upRate));
+	float centerRate = distancePerpend / localRadius;
+
+	float seed = (P_ID / _totalFishNum);
+	float random = (sin(seed) * (frac(seed) * 2.0f - 1.0f)) * 0.5f + 0.5f;
+	float upRateOwn = CustomRemap(seed, 0.0f, 1.0f, 0.03, 0.97f);;
+	float centerRateOwn = CustomRemap(random, 0.0f, 1.0f, _Eye, 0.90f);
+
+	float upRateDif = (upRateOwn - upRate) * _Stiffness;
+	float centerRateDif = (centerRateOwn - centerRate) * _Stiffness;
+
+	float3 normal = float3(0, 1, 0);
+	// Up vector
+	float3 vectorUp = upRateDif * (_Stiffness + 2.0f) * float3(0, 1, 0); 
+
+	// Vector to center
+	float3 centerOutVector = normalize(positionA - projectPoint);
+	float3 vectorCenter = abs(_SwirlStrength) * centerRateDif * centerOutVector;
+
+	// Swirl vector parallel to plane
+	float3 perpend = normalize(cross(normal, centerOutVector));
+	float3 vectorSwirl = _SwirlStrength * perpend;
+
+	// Get final force vector
+	float3 forceVector = vectorUp + vectorCenter + vectorSwirl;
+
+	float3 acceleration = CalculateSteer(forceVector, velocityA);
+	return acceleration;
+}
+
+
+[numthreads(256, 1, 1)]
+void MainCS(uint3 id : SV_DispatchThreadID)
+{
+	const unsigned int P_ID = id.x;
+
+	float3 position = _PositionBuffer[P_ID];
+	float3 velocity = _VelocityBuffer[P_ID];
+
+	float3 acceleration = (float3)0;
+
+    //default
+	acceleration += Flock(position, velocity);
+	//+ Only Vortex
+	acceleration += Vortex(position, velocity, (float)P_ID);
+
+	velocity = velocity + acceleration * _DeltaTime;//v = v0 + at
+	velocity = normalize(velocity) * clamp(length(velocity), _SpeedRange.x, _SpeedRange.y);
+
+	position = position + velocity * _DeltaTime; // s = vt
+
+	_PositionBuffer[P_ID] = position;
+	_VelocityBuffer[P_ID] = velocity;
+}
